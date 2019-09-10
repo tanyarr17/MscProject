@@ -1,0 +1,361 @@
+# Instal and import libraries
+!pip install vaderSentiment
+
+import numpy as np 
+import pandas as pd
+import re
+import io
+import requests
+import string
+import operator
+
+from tqdm import tqdm
+
+from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+
+from sklearn.metrics import accuracy_score,auc,f1_score,recall_score,precision_score,classification_report
+from sklearn.model_selection import train_test_split
+from sklearn.feature_extraction.text import CountVectorizer,TfidfVectorizer
+from sklearn.base import TransformerMixin
+from sklearn.pipeline import Pipeline, make_pipeline, make_union
+from sklearn.preprocessing import FunctionTransformer
+from sklearn.compose import ColumnTransformer, make_column_transformer
+from sklearn.decomposition import TruncatedSVD
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.naive_bayes import GaussianNB
+
+from functools import partial
+
+from bs4 import BeautifulSoup
+import html as ihtml
+
+import spacy
+import en_core_web_sm
+from spacy.lang.en import English
+from spacy.lang.en.stop_words import STOP_WORDS
+
+import warnings
+warnings.simplefilter('ignore')
+
+import os
+print(os.listdir("../input"))
+
+# Import data
+path = "/kaggle/input/imdb-movie-reviews-dataset/aclimdb/aclImdb/"
+positiveFiles = [x for x in os.listdir(path+"train/pos/") if x.endswith(".txt")]
+negativeFiles = [x for x in os.listdir(path+"train/neg/") if x.endswith(".txt")]
+positiveReviews, negativeReviews = [], []
+for pfile in positiveFiles:
+    with open(path+"train/pos/"+pfile) as f:
+        positiveReviews.append(f.read())
+for nfile in negativeFiles:
+    with open(path+"train/neg/"+nfile) as f:
+        negativeReviews.append(f.read())
+        
+reviews = pd.concat([
+    pd.DataFrame({"review":positiveReviews, "label":1, "file":positiveFiles}),
+    pd.DataFrame({"review":negativeReviews, "label":0, "file":negativeFiles})
+], ignore_index=True).sample(frac=1, random_state=1)
+reviews.head()
+
+# Pre-process
+# TransformerMixin is used for creating our own pipeline/class for a procedure
+class CleanText(TransformerMixin):
+    def transform(self, X, **transform_params):
+        return X.apply(lambda text: clean_text(text))
+    
+    def fit(self, X, y=None, **fit_params):
+        return self
+    
+    def get_params(self, deep=True):
+        return {}
+    
+def clean_text(text):
+    text = BeautifulSoup(ihtml.unescape(text)).text
+    text = re.sub(r"http[s]?://\S+", "", text)
+    text = re.sub(r"\s+", " ", text)
+    text = re.sub(r"[^a-zA-Z ]"," ",text)
+    return text
+
+nlp = spacy.load('en_core_web_lg', parse=True, tag=True, entity=True)
+punctuations = string.punctuation
+
+# stop words for filtering
+stopwords = list(STOP_WORDS)
+parser = English()
+
+# Baseline of feature extraction
+class ExtractFeatures(TransformerMixin):
+    def __init__(self):
+        pass
+
+    def fit(self, reviews, y=None):
+        return self
+    
+    def get_params(self, **kwargs):
+        return {}
+        
+    def extract_features(self, X):
+        doc = nlp(X,disable=['parser', 'ner'])
+        word_count = len(doc)
+        
+        # Creating a tokenized review text
+        mytokens = [ word.lemma_.lower().strip() if word.lemma_ != "-PRON-" else word.lower_ for word in doc ]
+         # Removing stop words
+        mytokens = [ word for word in mytokens if word not in stopwords and word not in punctuations ]
+        parsed_review = " ".join(mytokens)
+        
+        return pd.Series({'parsed_review': parsed_review, 
+                          'word_count': word_count
+                         })
+       
+    def transform(self, X, y=None):
+        return X.apply(lambda text: self.extract_features(text), 1)
+    
+def parse_column(X):
+    return X['parsed_review']
+def wc_column(X):
+    return X.loc[:,'word_count'].values[:,np.newaxis]
+
+# TF*IDF
+tfidf_pipeline = make_pipeline(
+    # Clean the text
+        CleanText(),
+    #Feature extraction
+        ExtractFeatures(),
+        make_union(
+            make_pipeline(
+                FunctionTransformer(parse_column,validate=False),
+                TfidfVectorizer(sublinear_tf=True, min_df=0.0025, max_df = 0.4,
+                        ngram_range=(1, 3), 
+                        stop_words=stopwords)
+            ),
+            FunctionTransformer(wc_column,validate=False)
+        ),
+)
+
+tfidf_prepipeline = make_column_transformer(
+    (tfidf_pipeline,'review')
+)
+
+# Bag of Words
+bow_pipeline = make_pipeline(
+    # Clean the text
+        CleanText(),
+    #Feature extraction
+        ExtractFeatures(),
+        make_union(
+            make_pipeline(
+                FunctionTransformer(parse_column,validate=False),
+                CountVectorizer(ngram_range=(1,1))
+            ),
+            FunctionTransformer(wc_column,validate=False)
+        ),
+)
+
+bow_prepipeline = make_column_transformer(
+    (bow_pipeline,'review')
+)
+
+# Train and test split
+train = reviews[reviews.label.isin([0,1])]
+X_train, X_test, Y_train, Y_test = train_test_split(train.drop('label',1), train.label)
+X_train.reset_index(inplace=True,drop=True)
+
+# Logistic Regression (TF*IDF and BoW)
+lr_model = Pipeline([
+    ("preprocessor", tfidf_prepipeline),
+    ("svd", TruncatedSVD(n_components=1000, n_iter=7, random_state=42)),
+    ("model", LogisticRegression(class_weight='balanced', solver='liblinear'))
+])
+
+lr_model2 = Pipeline([
+    ("preprocessor", bow_prepipeline),
+    ("svd", TruncatedSVD(n_components=1000, n_iter=7, random_state=42)),
+    ("model", LogisticRegression(class_weight='balanced', solver='liblinear'))
+])
+
+lr_model.fit(X_train, Y_train)
+Y_pred = lr_model.predict(X_test)
+lracc = accuracy_score(Y_test, Y_pred)
+lrfs = f1_score(Y_test, Y_pred,pos_label=1)
+print(classification_report(Y_test, Y_pred))
+
+lr_model2.fit(X_train, Y_train)
+Y_pred = lr_model2.predict(X_test)
+lracc2 = accuracy_score(Y_test, Y_pred)
+lrfs2 = f1_score(Y_test, Y_pred,pos_label=1)
+print(classification_report(Y_test, Y_pred))
+
+# RandomForest (TFIDF & BoW)
+rf_model = Pipeline([
+    ("preprocessor", tfidf_prepipeline),
+    ("svd", TruncatedSVD(n_components=100, n_iter=7, random_state=42)),
+    ("model", RandomForestClassifier(class_weight='balanced', n_estimators=500, n_jobs=-1))
+])
+
+rf_model2 = Pipeline([
+    ("preprocessor", bow_prepipeline),
+    ("svd", TruncatedSVD(n_components=100, n_iter=7, random_state=42)),
+    ("model", RandomForestClassifier(class_weight='balanced', n_estimators=100, n_jobs=-1))
+])
+
+rf_model.fit(X_train, Y_train)
+Y_pred = rf_model.predict(X_test)
+rfacc = accuracy_score(Y_test, Y_pred)
+rffs = f1_score(Y_test, Y_pred,pos_label=1)
+print(classification_report(Y_test, Y_pred))
+
+rf_model2.fit(X_train, Y_train)
+Y_pred = rf_model2.predict(X_test)
+rfacc2 = accuracy_score(Y_test, Y_pred)
+rffs2 = f1_score(Y_test, Y_pred,pos_label=1)
+print(classification_report(Y_test, Y_pred))
+
+# GaussianNB (TFIDF & BoW)
+nb_model = Pipeline([
+    ("preprocessor", tfidf_prepipeline),
+    ("svd", TruncatedSVD(n_components=100, n_iter=7, random_state=42)),
+    ("model", GaussianNB())
+])
+
+nb_model2 = Pipeline([
+    ("preprocessor", bow_prepipeline),
+    ("svd", TruncatedSVD(n_components=100, n_iter=7, random_state=42)),
+    ("model", GaussianNB())
+])
+
+nb_model.fit(X_train, Y_train)
+Y_pred = nb_model.predict(X_test)
+nbacc = accuracy_score(Y_test, Y_pred)
+nbfs = f1_score(Y_test, Y_pred,pos_label=1)
+print(classification_report(Y_test, Y_pred))
+
+nb_model2.fit(X_train, Y_train)
+Y_pred = nb_model2.predict(X_test)
+nbacc2 = accuracy_score(Y_test, Y_pred)
+nbfs2 = f1_score(Y_test, Y_pred,pos_label=1)
+print(classification_report(Y_test, Y_pred))
+
+# Result table
+# Accuracy
+data = [['TFIDF', lracc, rfacc, nbacc], ['BoW', lracc2, rfacc2, nbacc2]]
+pd.DataFrame(data, columns=[" ", "Logistic Regression", "RandomForest", "Naive Bayes"])
+
+# F1 score
+data = [['TFIDF', lrfs, rffs, nbfs], ['BoW', lrfs2, rffs2, nbfs2]]
+pd.DataFrame(data, columns=[" ", "Logistic Regression", "RandomForest", "Naive Bayes"])
+
+# Retrieve keywords for categories in reviews
+aspect_terms_keywords = []
+for x in tqdm(range(len(reviews['review']))):
+    amod = []
+    advmod = []
+    xcomp = []
+    neg = []
+    compound = []
+    if len(str(reviews['review'][x])) != 0:
+        text = str(reviews['review'][x])
+        text = BeautifulSoup(ihtml.unescape(text)).text
+        # manual list of stopwords to be removed manually
+        lines = text.replace('*','').replace('-','').replace('also ','').replace('Also ','').replace('so ','').replace('be ','').replace('are ','').replace('It ','').replace('it ','').replace('just ','').replace('get ','').replace('were ','').replace('Would ','').replace('would ','').replace('When ','').replace('when ','').replace('This ','').replace('this ','').replace('That ','').replace('that ','').replace('again ','').replace('where ','').replace('how ','').replace('has ','').replace('Here ','').replace('here ','').replace('now ','').replace('see ','').replace('why ','').split('.')              
+        for line in lines:
+            doc = nlp(line)
+            str1=''
+            str2=''
+            for token in doc:
+                if token.pos_ is 'NOUN':
+                    for j in token.lefts:
+                        if j.dep_ == 'compound':
+                            compound.append((j.text+' '+token.text,token.text))
+                        if j.dep_ is 'amod' and j.pos_ is 'ADJ':
+                            str1 = j.text+' '+token.text
+                            amod.append(j.text+' '+token.text)
+                            for k in j.lefts:
+                                if k.dep_ is 'advmod':
+                                    str2 = k.text+' '+j.text+' '+token.text
+                                    amod.append(k.text+' '+j.text+' '+token.text)
+                            match = re.search(re.escape(str1),re.escape(str2))
+                            if match is not None:
+                                amod.remove(str1)
+                if token.pos_ is 'VERB':
+                    for j in token.lefts:
+                        if j.dep_ is 'advmod' and j.pos_ is 'ADV':
+                            advmod.append(j.text+' '+token.text)
+                        if j.dep_ is 'neg' and j.pos_ is 'ADV':
+                            neg.append(j.text+' '+token.text)
+                    for j in token.rights:
+                        if j.dep_ is 'advmod'and j.pos_ is 'ADV':
+                            advmod.append(token.text+' '+j.text)
+                if token.pos_ is 'ADJ':
+                    for j,h in zip(token.rights,token.lefts):
+                        if j.dep_ is 'xcomp' and h.dep_ is not 'neg':
+                            for k in j.lefts:
+                                if k.dep_ is 'aux':
+                                    xcomp.append(token.text+' '+k.text+' '+j.text)
+                        elif j.dep_ is 'xcomp' and h.dep_ is 'neg':
+                            if k.dep_ is 'aux':
+                                    neg.append(h.text +' '+token.text+' '+k.text+' '+j.text)
+        pairs = list(set(amod+advmod+neg+xcomp))
+        for i in range(len(pairs)):
+            if len(compound)!=0:
+                for comp in compound:
+                    match = re.search(re.escape(comp[1]),re.escape(pairs[i]))
+                    if match is not None:
+                        pairs[i] = pairs[i].replace(match.group(),comp[0])        
+    aspect_terms_keywords.append(pairs)
+reviews['aspect_keywords'] = aspect_terms_keywords
+reviews.head()
+
+# Polarities of keywords, sentences and overall classification
+analyser = SentimentIntensityAnalyzer()
+predict_sentiment = []
+for i in range(len(reviews)):
+    tag_score={'pos':0,'neg':0}
+    if len(reviews['aspect_keywords'][i])!=0: 
+        for phrases in reviews['aspect_keywords'][i]:
+            sent = analyser.polarity_scores(phrases)
+            tag_score['neg'] += sent['neg']
+            tag_score['pos'] += sent['pos']
+        predict_sentiment.append(max(tag_score.items(), key=operator.itemgetter(1))[0])
+    else:
+        predict_sentiment.append('neg')
+reviews['predicted_sentiment'] = predict_sentiment
+reviews.head()
+
+pos = []
+for i in reviews['label']:
+    if i == 1:
+        pos.append('pos')
+    else:
+        pos.append('neg')
+reviews['actual_sentiment'] = pos
+reviews.head()
+
+# ABSA results
+print('accuracy')
+absaacc = accuracy_score(reviews.actual_sentiment, reviews.predicted_sentiment)
+print(absaacc)
+print('f1 score')
+absafs = f1_score(reviews.actual_sentiment, reviews.predicted_sentiment,pos_label='pos')
+print(absafs)
+print('recall')
+absar = recall_score(reviews.actual_sentiment, reviews.predicted_sentiment,pos_label='pos')
+print(absar)
+print('precision')
+absap = precision_score(reviews.actual_sentiment, reviews.predicted_sentiment,pos_label='pos')
+print(absap)
+
+# Comparison
+# TF*IDF
+data = [[lracc, rfacc, nbacc, absaacc]]
+pd.DataFrame(data, columns=["Logistic Regression", "RandomForest", "Naive Bayes", "ABSA"])
+data = [[lrfs, rffs, nbfs, absafs]]
+pd.DataFrame(data, columns=["Logistic Regression", "RandomForest", "Naive Bayes", "ABSA"])
+
+# BoW
+data = [[lracc2, rfacc2, nbacc2, absaacc]]
+pd.DataFrame(data, columns=["Logistic Regression", "RandomForest", "Naive Bayes", "ABSA"])
+data = [[lrfs2, rffs2, nbfs2, absafs]]
+pd.DataFrame(data, columns=["Logistic Regression", "RandomForest", "Naive Bayes", "ABSA"])
